@@ -19,6 +19,8 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
 {
     internal sealed class ServiceBusListener : IListener, IScaleMonitorProvider
     {
+        private const int ConcurrencyUpdateIntervalMS = 1000;
+
         private readonly ITriggeredFunctionExecutor _triggerExecutor;
         private readonly string _entityPath;
         private readonly bool _isSessionsEnabled;
@@ -33,13 +35,17 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
         private readonly Lazy<ServiceBusClient> _client;
         private readonly Lazy<SessionMessageProcessor> _sessionMessageProcessor;
         private readonly Lazy<ServiceBusScaleMonitor> _scaleMonitor;
+        private readonly ConcurrencyManager _concurrencyManager;
 
         private volatile bool _disposed;
         private volatile bool _started;
         // Serialize execution of StopAsync to avoid calling Unregister* concurrently
         private readonly SemaphoreSlim _stopAsyncSemaphore = new SemaphoreSlim(1, 1);
+        private readonly string _functionId;
         private CancellationTokenRegistration _batchReceiveRegistration;
         private Task _batchLoop;
+        private Timer _concurrencyUpdateTimer;
+        private bool _messagesProcessedSinceLastConcurrencyUpdate;
 
         public ServiceBusListener(
             string functionId,
@@ -53,7 +59,8 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
             MessagingProvider messagingProvider,
             ILoggerFactory loggerFactory,
             bool singleDispatch,
-            ServiceBusClientFactory clientFactory)
+            ServiceBusClientFactory clientFactory,
+            ConcurrencyManager concurrencyManager)
         {
             _entityPath = entityPath;
             _isSessionsEnabled = isSessionsEnabled;
@@ -61,6 +68,13 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
             _triggerExecutor = triggerExecutor;
             _cancellationTokenSource = new CancellationTokenSource();
             _logger = loggerFactory.CreateLogger<ServiceBusListener>();
+            _concurrencyManager = concurrencyManager;
+            _functionId = functionId;
+
+            if (_concurrencyManager.Enabled)
+            {
+                _concurrencyUpdateTimer = new Timer(UpdateConcurrency, null, Timeout.Infinite, Timeout.Infinite);
+            }
 
             _client = new Lazy<ServiceBusClient>(
                 () =>
@@ -73,16 +87,30 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
                     options.ToReceiverOptions()));
 
             _messageProcessor = new Lazy<MessageProcessor>(
-                () => messagingProvider.CreateMessageProcessor(
-                    _client.Value,
-                    _entityPath,
-                    options.ToProcessorOptions(_autoCompleteMessagesOptionEvaluatedValue)));
+                () =>
+                {
+                    var processorOptions = options.ToProcessorOptions(_autoCompleteMessagesOptionEvaluatedValue);
+                    if (_concurrencyManager.Enabled)
+                    {
+                        // when DC is enabled, concurrency starts at 1 and will be dynamically adjusted over time
+                        // by UpdateConcurrency.
+                        processorOptions.MaxConcurrentCalls = 1;
+                    }
+                    return messagingProvider.CreateMessageProcessor(_client.Value, _entityPath, processorOptions);
+                });
 
             _sessionMessageProcessor = new Lazy<SessionMessageProcessor>(
-                () => messagingProvider.CreateSessionMessageProcessor(
-                    _client.Value,
-                    _entityPath,
-                    options.ToSessionProcessorOptions(_autoCompleteMessagesOptionEvaluatedValue)));
+                () =>
+                {
+                    var sessionProcessorOptions = options.ToSessionProcessorOptions(_autoCompleteMessagesOptionEvaluatedValue);
+                    if (_concurrencyManager.Enabled)
+                    {
+                        // when DC is enabled, session concurrency starts at 1 and will be dynamically adjusted over time
+                        // by UpdateConcurrency.
+                        sessionProcessorOptions.MaxConcurrentSessions = 1;
+                    }
+                    return messagingProvider.CreateSessionMessageProcessor(_client.Value,_entityPath, sessionProcessorOptions);
+                });
 
             _scaleMonitor = new Lazy<ServiceBusScaleMonitor>(
                 () => new ServiceBusScaleMonitor(
@@ -118,6 +146,11 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
                 {
                     _messageProcessor.Value.Processor.ProcessMessageAsync += ProcessMessageAsync;
                     await _messageProcessor.Value.Processor.StartProcessingAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                if (_concurrencyManager.Enabled)
+                {
+                    _concurrencyUpdateTimer.Change(ConcurrencyUpdateIntervalMS, Timeout.Infinite);
                 }
             }
             else
@@ -174,6 +207,47 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
             _cancellationTokenSource.Cancel();
         }
 
+        private void UpdateConcurrency(object state)
+        {
+            try
+            {
+                if (!_messagesProcessedSinceLastConcurrencyUpdate)
+                {
+                    // if the function is currently inactive, we can skip the concurrency update check
+                    return;
+                }
+                _messagesProcessedSinceLastConcurrencyUpdate = false;
+
+                // below we'll dynamically update the processor with new concurrency values if any
+                // need to be changed
+                var concurrencyStatus = _concurrencyManager.GetStatus(_functionId);
+                var currentConcurrency = concurrencyStatus.CurrentConcurrency;
+
+                if (_isSessionsEnabled)
+                {
+                    var sessionProcessor = _sessionMessageProcessor.Value.Processor;
+                    if (currentConcurrency != sessionProcessor.MaxConcurrentSessions)
+                    {
+                        // Per session call concurrency is limited to 1 meaning sessions are 1:1 with invocations.
+                        // So we can scale MaxConcurrentSessions 1:1 with CurrentConcurrency.
+                        sessionProcessor.UpdateConcurrency(currentConcurrency, sessionProcessor.MaxConcurrentCallsPerSession);
+                    }
+                }
+                else
+                {
+                    var processor = _messageProcessor.Value.Processor;
+                    if (currentConcurrency != processor.MaxConcurrentCalls)
+                    {
+                        processor.UpdateConcurrency(currentConcurrency);
+                    }
+                }
+            }
+            finally
+            {
+                _concurrencyUpdateTimer.Change(ConcurrencyUpdateIntervalMS, Timeout.Infinite);
+            }
+        }
+
         [SuppressMessage("Microsoft.Usage", "CA2213:DisposableFieldsShouldBeDisposed", MessageId = "_cancellationTokenSource")]
         public void Dispose()
         {
@@ -212,12 +286,15 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
             _stopAsyncSemaphore.Dispose();
             _cancellationTokenSource.Dispose();
             _batchReceiveRegistration.Dispose();
+            _concurrencyUpdateTimer.Dispose();
 
             _disposed = true;
         }
 
         internal async Task ProcessMessageAsync(ProcessMessageEventArgs args)
         {
+            _messagesProcessedSinceLastConcurrencyUpdate = true;
+
             using (CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(args.CancellationToken, _cancellationTokenSource.Token))
             {
                 var actions = new ServiceBusMessageActions(args);
@@ -237,6 +314,8 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
 
         internal async Task ProcessSessionMessageAsync(ProcessSessionMessageEventArgs args)
         {
+            _messagesProcessedSinceLastConcurrencyUpdate = true;
+
             using (CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(args.CancellationToken, _cancellationTokenSource.Token))
             {
                 var actions = new ServiceBusSessionMessageActions(args);
@@ -275,6 +354,19 @@ namespace Microsoft.Azure.WebJobs.ServiceBus.Listeners
                     {
                         _logger.LogInformation("Message processing has been stopped or cancelled");
                         return;
+                    }
+
+                    if (_concurrencyManager.Enabled)
+                    {
+                        // Dynamic concurrency is enabled so consult ConcurrencyManager to see if we're safe to start new invocations.
+                        // Because we're only executing functions below one at a time serially, we only need to check here whether throttles
+                        // are enabled.
+                        var concurrencyStatus = _concurrencyManager.GetStatus(_functionId);
+                        if (concurrencyStatus.ThrottleStatus.State == ThrottleState.Enabled)
+                        {
+                            await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+                            continue;
+                        }
                     }
 
                     if (_isSessionsEnabled && (receiver == null || receiver.IsClosed))
